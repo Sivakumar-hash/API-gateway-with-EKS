@@ -104,7 +104,122 @@ https://helm.sh/docs/intro/install/
   
     
 #Deploy node js applications
+
+kubectl apply -f https://github.com/Sivakumar-hash/nodejs-EKS/blob/master/deployment.yaml
+
+kubectl apply -f https://github.com/Sivakumar-hash/nodejs-EKS/blob/master/service.yaml
+
 #Creat API Gateway resources
+AGW_VPCLINK_SG=$(aws ec2 create-security-group \
+  --description "SG for VPC Link" \
+  --group-name SG_VPC_LINK \
+  --vpc-id $AGW_VPC_ID \
+  --region $AGW_AWS_REGION \
+  --output text \
+  --query 'GroupId')
+  
 #Create a VPC Link for the internal NLB
+
+cat > vpclink.yaml<<EOF
+apiVersion: apigatewayv2.services.k8s.aws/v1alpha1
+kind: VPCLink
+metadata:
+  name: nlb-internal
+spec:
+  name: nlb-internal
+  securityGroupIDs: 
+    - $AGW_VPCLINK_SG
+  subnetIDs: 
+    - $(aws ec2 describe-subnets \
+          --filter Name=tag:kubernetes.io/role/internal-elb,Values=1 \
+          --query 'Subnets[0].SubnetId' \
+          --region $AGW_AWS_REGION --output text)
+    - $(aws ec2 describe-subnets \
+          --filter Name=tag:kubernetes.io/role/internal-elb,Values=1 \
+          --query 'Subnets[1].SubnetId' \
+          --region $AGW_AWS_REGION --output text)
+    - $(aws ec2 describe-subnets \
+          --filter Name=tag:kubernetes.io/role/internal-elb,Values=1 \
+          --query 'Subnets[2].SubnetId' \
+          --region $AGW_AWS_REGION --output text)
+          EOF
+       kubectl apply -f vpclink.yaml
+                        
+Create an API with VPC Link integration:
+  cat > apigw-api.yaml<<EOF
+apiVersion: apigatewayv2.services.k8s.aws/v1alpha1
+kind: API
+metadata:
+  name: apitest-private-nlb
+spec:
+  body: '{
+              "openapi": "3.0.1",
+              "info": {
+                "title": "ack-apigwv2-import-test-private-nlb",
+                "version": "v1"
+              },
+              "paths": {
+              "/\$default": {
+                "x-amazon-apigateway-any-method" : {
+                "isDefaultRoute" : true,
+                "x-amazon-apigateway-integration" : {
+                "payloadFormatVersion" : "1.0",
+                "connectionId" : "$(kubectl get vpclinks.apigatewayv2.services.k8s.aws \
+  nlb-internal \
+  -o jsonpath="{.status.vpcLinkID}")",
+      "type" : "http_proxy",
+                "httpMethod" : "GET",
+                "uri" : "$(aws elbv2 describe-listeners \
+  --load-balancer-arn $(aws elbv2 describe-load-balancers \
+  --region $AGW_AWS_REGION \
+  --query "LoadBalancers[?contains(DNSName, '$(kubectl get service authorservice \
+  -o jsonpath="{.status.loadBalancer.ingress[].hostname}")')].LoadBalancerArn" \
+  --output text) \
+  --region $AGW_AWS_REGION \
+  --query "Listeners[0].ListenerArn" \
+  --output text)",
+               "connectionType" : "VPC_LINK"
+                  }
+                }
+              },
+              "/meta": {
+                  "get": {
+                    "x-amazon-apigateway-integration": {
+                       "uri" : "$(aws elbv2 describe-listeners \
+  --load-balancer-arn $(aws elbv2 describe-load-balancers \
+  --region $AGW_AWS_REGION \
+  --query "LoadBalancers[?contains(DNSName, '$(kubectl get service echoserver \
+  -o jsonpath="{.status.loadBalancer.ingress[].hostname}")')].LoadBalancerArn" \
+  --output text) \
+  "httpMethod": "GET",
+                      "connectionId": "$(kubectl get vpclinks.apigatewayv2.services.k8s.aws \
+  nlb-internal \
+  -o jsonpath="{.status.vpcLinkID}")",
+                      "type": "HTTP_PROXY",
+                      "connectionType": "VPC_LINK",
+                      "payloadFormatVersion": "1.0"
+                    }
+                  }
+                }
+              },
+              "components": {}
+        }'
+EOF
+  kubectl apply -f apigw-api.yaml
+  
+  
 #Create a stage
+ echo "
+apiVersion: apigatewayv2.services.k8s.aws/v1alpha1
+kind: Stage
+metadata:
+  name: "apiv1"
+spec:
+  apiID: $(kubectl get apis.apigatewayv2.services.k8s.aws apitest-private-nlb -o=jsonpath='{.status.apiID}')
+  stageName: api
+  autoDeploy: true
+" | kubectl apply -f -
+  
 #Invoke API
+    curl $(kubectl get api apitest-private-nlb -o jsonpath="{.status.apiEndpoint}")/users/123
+
